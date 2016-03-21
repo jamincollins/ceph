@@ -136,7 +136,8 @@ public:
     std::condition_variable flush_cond;   ///< wait here for unapplied txns
     set<TransContext*> flush_txns;   ///< committing or wal txns
 
-    uint64_t tail_offset;
+    uint64_t tail_offset = 0;
+    uint64_t tail_txc_seq = 0;
     bufferlist tail_bl;
 
     Onode(const ghobject_t& o, const string& k)
@@ -193,11 +194,11 @@ public:
 
     bool exists;
 
+    EnodeSet enode_set;      ///< open Enodes
+
     // cache onodes on a per-collection basis to avoid lock
     // contention.
     OnodeHashLRU onode_map;
-
-    EnodeSet enode_set;      ///< open Enodes
 
     OnodeRef get_onode(const ghobject_t& oid, bool create);
     EnodeRef get_enode(uint32_t hash);
@@ -312,6 +313,7 @@ public:
 
     CollectionRef first_collection;  ///< first referenced collection
 
+    uint64_t seq = 0;
     utime_t start;
 
     explicit TransContext(OpSequencer *o)
@@ -367,6 +369,8 @@ public:
     std::mutex wal_apply_mutex;
     std::unique_lock<std::mutex> wal_apply_lock;
 
+    uint64_t last_seq = 0;
+
     OpSequencer()
 	//set the qlock to to PTHREAD_MUTEX_RECURSIVE mode
       : parent(NULL),
@@ -378,6 +382,7 @@ public:
 
     void queue_new(TransContext *txc) {
       std::lock_guard<std::mutex> l(qlock);
+      txc->seq = ++last_seq;
       q.push_back(*txc);
     }
 
@@ -399,6 +404,28 @@ public:
       assert(txc->state < TransContext::STATE_KV_DONE);
       txc->oncommits.push_back(c);
       return false;
+    }
+
+    /// if there is a wal on @seq, wait for it to apply
+    void wait_for_wal_on_seq(uint64_t seq) {
+      std::unique_lock<std::mutex> l(qlock);
+      restart:
+      for (OpSequencer::q_list_t::reverse_iterator p = q.rbegin();
+	   p != q.rend();
+	   ++p) {
+	if (p->seq == seq) {
+	  TransContext *txc = &(*p);
+	  if (txc->wal_txn) {
+	    while (txc->state < TransContext::STATE_WAL_CLEANUP) {
+	      txc->osr->qcond.wait(l);
+	      goto restart;  // txc may have gone away
+	    }
+	  }
+	  break;
+	}
+	if (p->seq < seq)
+	  break;
+      }
     }
   };
 
@@ -613,7 +640,8 @@ private:
   int _wal_replay();
 
   // for fsck
-  int _verify_enode_shared(EnodeRef enode, vector<bluestore_extent_t>& v);
+  int _verify_enode_shared(EnodeRef enode, vector<bluestore_extent_t>& v,
+			   interval_set<uint64_t> &used_blocks);
 
 public:
   BlueStore(CephContext *cct, const string& path);
@@ -837,12 +865,14 @@ private:
   int _do_write_overlays(TransContext *txc, CollectionRef& c, OnodeRef o,
 			 uint64_t offset, uint64_t length);
   void _do_read_all_overlays(bluestore_wal_op_t& wo);
-  void _pad_zeros(OnodeRef o, bufferlist *bl, uint64_t *offset, uint64_t *length,
+  void _pad_zeros(TransContext *txc,
+		  OnodeRef o, bufferlist *bl, uint64_t *offset, uint64_t *length,
 		  uint64_t block_size);
   void _pad_zeros_head(OnodeRef o, bufferlist *bl,
 		       uint64_t *offset, uint64_t *length,
 		       uint64_t block_size);
-  void _pad_zeros_tail(OnodeRef o, bufferlist *bl,
+  void _pad_zeros_tail(TransContext *txc,
+		       OnodeRef o, bufferlist *bl,
 		       uint64_t offset, uint64_t *length,
 		       uint64_t block_size);
   int _do_allocate(TransContext *txc,
